@@ -1,0 +1,1463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#000000">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Spot4Me</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@1,9..144,700&display=swap">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { background: #060e06; min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ─── Config ───────────────────────────────────────────────────────────────────
+    const CLIENT_ID    = "8e21186a28914dcfbb846f8c6b6ee2af";
+    const REDIRECT_URI = "https://mickwks.github.io/spot4me-app/";
+    const SCOPES = [
+      "user-read-currently-playing",
+      "user-read-playback-state",
+      "user-read-private",
+      "user-read-recently-played",
+      "user-library-read",
+      "user-library-modify",
+      "user-modify-playback-state",
+      "playlist-read-private",
+      "playlist-modify-public",
+      "playlist-modify-private",
+    ].join(" ");
+
+    // ─── Storage keys ─────────────────────────────────────────────────────────────
+    const K = {
+      HOME_URL:      "s4m_home_url",
+      AUTH_CODE:     "s4m_auth_code",
+      REFRESH_TOKEN: "s4m_refresh_token",
+      HISTORY:       "s4m_history",
+      VERIFIER:      "s4m_pkce_verifier",
+      ACCESS_TOKEN:  "s4m_access_token",
+      PINNED:        "s4m_pinned",
+      PL_USAGE:      "s4m_pl_usage",
+    };
+
+    // ─── PKCE helpers ─────────────────────────────────────────────────────────────
+    function randomString(len) {
+      const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+      const bytes = crypto.getRandomValues(new Uint8Array(len));
+      return Array.from(bytes, b => chars[b % chars.length]).join("");
+    }
+
+    async function codeChallenge(verifier) {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+      return btoa(String.fromCharCode(...new Uint8Array(digest)))
+        .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+    }
+
+    // ─── Token management ─────────────────────────────────────────────────────────
+    let _accessToken = sessionStorage.getItem(K.ACCESS_TOKEN) || null;
+
+    async function refreshAccessToken() {
+      const rt = localStorage.getItem(K.REFRESH_TOKEN);
+      if (!rt) return null;
+      try {
+        const res = await fetch("https://accounts.spotify.com/api/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type:    "refresh_token",
+            refresh_token: rt,
+            client_id:     CLIENT_ID,
+          }),
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (data.refresh_token) localStorage.setItem(K.REFRESH_TOKEN, data.refresh_token);
+        return data.access_token || null;
+      } catch {
+        return null;
+      }
+    }
+
+    async function spotifyFetch(url, options = {}) {
+      const withAuth = (token) => fetch(url, {
+        ...options,
+        headers: { ...options.headers, Authorization: `Bearer ${token}` },
+      });
+      let res = await withAuth(_accessToken);
+      if (res.status === 401) {
+        const newToken = await refreshAccessToken();
+        if (newToken) {
+          _accessToken = newToken;
+          sessionStorage.setItem(K.ACCESS_TOKEN, newToken);
+          res = await withAuth(newToken);
+        } else {
+          return { status: 401, authFailed: true };
+        }
+      }
+      return res;
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────────
+    function relativeTime(iso) {
+      const diff = Date.now() - new Date(iso).getTime();
+      const m = Math.floor(diff / 60000);
+      if (m < 1)  return "just now";
+      if (m < 60) return `${m}m ago`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}h ago`;
+      return `${Math.floor(h / 24)}d ago`;
+    }
+
+    function fmtMs(ms) {
+      const s = Math.floor((ms || 0) / 1000);
+      return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    }
+
+    function readHistory()  { try { return JSON.parse(localStorage.getItem(K.HISTORY) || "[]"); } catch { return []; } }
+    function saveHistory(e) { localStorage.setItem(K.HISTORY,  JSON.stringify(e.slice(0, 50))); }
+    function readPinned()   { try { return JSON.parse(localStorage.getItem(K.PINNED)  || "[]"); } catch { return []; } }
+    function savePinned(p)  { localStorage.setItem(K.PINNED,   JSON.stringify(p)); }
+    function readPlUsage()  { try { return JSON.parse(localStorage.getItem(K.PL_USAGE)|| "{}"); } catch { return {}; } }
+    function savePlUsage(u) { localStorage.setItem(K.PL_USAGE, JSON.stringify(u)); }
+
+    function exportHistoryCsv(history) {
+      if (!history.length) return;
+      const rows = history.map(e =>
+        [e.trackName, e.artist, e.genre || "", e.playlistName, e.timestamp]
+          .map(v => `"${String(v ?? "").replace(/"/g, '""')}"`)
+          .join(",")
+      );
+      const blob = new Blob([["Track,Artist,Genre,Playlist,Added At", ...rows].join("\n")], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      Object.assign(document.createElement("a"), { href: url, download: "spot4me-history.csv" }).click();
+      URL.revokeObjectURL(url);
+    }
+
+    function parseLrc(lrc) {
+      if (!lrc) return [];
+      return lrc.split("\n")
+        .map(line => {
+          const m = line.match(/^\[(\d{2}):(\d{2}(?:\.\d+)?)\]\s*(.*)/);
+          if (!m) return null;
+          return { timeMs: (parseInt(m[1]) * 60 + parseFloat(m[2])) * 1000, text: m[3].trim() };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.timeMs - b.timeMs);
+    }
+
+    // ─── Styles ───────────────────────────────────────────────────────────────────
+    const CSS = `
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      .app {
+        min-height: 100vh;
+        background: #060e06;
+        color: #FBF5DD;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        max-width: 480px;
+        margin: 0 auto;
+        padding: 20px 16px 48px;
+      }
+
+      /* Header */
+      .hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
+      .logo { font-size: 22px; font-weight: 700; color: #FBF5DD; letter-spacing: -0.3px; font-family: 'Fraunces', serif; font-style: italic; }
+      .live-dot {
+        display: inline-block; width: 6px; height: 6px;
+        background: #7cc471; border-radius: 50%;
+        margin-right: 6px; vertical-align: middle;
+        animation: pulse-live 2s ease-in-out infinite;
+      }
+      @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+      .sign-out-btn {
+        background: none; border: 1px solid rgba(251,245,221,0.12); color: rgba(251,245,221,0.38);
+        padding: 6px 14px; border-radius: 20px; font-size: 12px; cursor: pointer;
+        transition: border-color .2s, color .2s, background .2s;
+      }
+      .sign-out-btn:hover { border-color: rgba(251,245,221,0.28); color: #E7E1B1; background: rgba(251,245,221,0.04); }
+
+      /* Auth / loading screens */
+      .center-screen {
+        display: flex; flex-direction: column; align-items: center;
+        justify-content: center; min-height: 80vh; gap: 24px; text-align: center;
+      }
+      .auth-icon {
+        width: 88px; height: 88px;
+        background: #306D29;
+        border-radius: 50%;
+        display: flex; align-items: center; justify-content: center; font-size: 40px;
+        box-shadow: 0 0 40px rgba(48,109,41,0.35), 0 8px 24px rgba(0,0,0,0.5);
+      }
+      .auth-title  { font-size: 28px; font-weight: 800; letter-spacing: -0.5px; color: #FBF5DD; }
+      .auth-sub    { color: rgba(251,245,221,0.48); font-size: 14px; line-height: 1.6; max-width: 280px; }
+      .connect-btn {
+        background: #FBF5DD; color: #0D530E; border: none;
+        padding: 16px 48px; border-radius: 50px;
+        font-size: 16px; font-weight: 700; cursor: pointer;
+        letter-spacing: .3px; transition: opacity .2s, transform .1s;
+      }
+      .connect-btn:hover  { opacity: 0.9; transform: scale(1.02); }
+      .connect-btn:active { transform: scale(0.98); }
+
+      /* Error card */
+      .err-card {
+        background: rgba(255,50,50,0.05); border: 1px solid rgba(255,50,50,0.2); border-radius: 16px;
+        padding: 20px; margin-top: 40px;
+      }
+      .err-title { color: #ff5555; font-weight: 700; margin-bottom: 8px; font-size: 15px; }
+      .err-msg   { color: rgba(251,245,221,0.4); font-size: 13px; line-height: 1.5; }
+      .err-retry {
+        margin-top: 16px; background: none; border: 1px solid rgba(255,50,50,0.3);
+        color: #ff5555; padding: 8px 20px; border-radius: 10px; cursor: pointer; font-size: 14px;
+        transition: background .2s;
+      }
+      .err-retry:hover { background: rgba(255,50,50,0.08); }
+
+      /* Cards */
+      .card {
+        background: #0c1a0c;
+        border: 1px solid rgba(231,225,177,0.07);
+        border-radius: 18px; padding: 18px; margin-bottom: 12px;
+        box-shadow: 0 2px 14px rgba(0,0,0,0.45);
+      }
+      .card-hdr {
+        display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;
+      }
+      .card-label {
+        font-size: 10px; font-weight: 700; letter-spacing: 1.8px;
+        text-transform: uppercase; color: #7cc471;
+      }
+      .np-controls { display: flex; align-items: center; gap: 4px; }
+      .ctrl {
+        background: none; border: none; color: rgba(251,245,221,0.3); cursor: pointer; padding: 5px 7px;
+        font-size: 14px; transition: color .2s, background .15s; border-radius: 6px;
+      }
+      .ctrl:hover   { color: #E7E1B1; background: rgba(251,245,221,0.06); }
+      .ctrl:disabled { opacity: .3; cursor: default; }
+      .cd-label { font-size: 11px; color: rgba(251,245,221,0.22); min-width: 20px; text-align: center; font-variant-numeric: tabular-nums; }
+
+      /* Now Playing */
+      .np-body { display: flex; gap: 16px; align-items: flex-start; }
+      .album-art {
+        width: 96px; height: 96px; border-radius: 10px; object-fit: cover; flex-shrink: 0;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      }
+      .album-art-ph {
+        width: 96px; height: 96px; border-radius: 10px;
+        background: #0e1f0e;
+        border: 1px solid rgba(231,225,177,0.06);
+        flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 32px;
+      }
+      .np-text  { flex: 1; min-width: 0; padding-top: 4px; }
+      .np-track { font-size: 17px; font-weight: 700; color: #FBF5DD; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: -0.2px; }
+      .np-artist { font-size: 14px; color: #E7E1B1; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .np-album  { font-size: 12px; color: rgba(251,245,221,0.38); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .genre-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+      .genre-tag {
+        display: inline-block;
+        background: rgba(48,109,41,0.2);
+        border: 1px solid rgba(48,109,41,0.4);
+        color: #8cc47f; padding: 2px 10px; border-radius: 20px; font-size: 10px; font-weight: 600;
+        letter-spacing: 0.3px;
+      }
+
+      /* Progress bar */
+      .progress-wrap { margin-top: 14px; }
+      .progress-bar {
+        height: 4px; background: rgba(251,245,221,0.08); border-radius: 2px; overflow: hidden; cursor: pointer;
+      }
+      .progress-fill {
+        height: 100%;
+        background: #306D29;
+        border-radius: 2px;
+        transition: width .5s linear;
+      }
+      .progress-times {
+        display: flex; justify-content: space-between;
+        font-size: 10px; color: rgba(251,245,221,0.22); margin-top: 5px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* Playback controls */
+      .playback-controls {
+        display: flex; align-items: center; justify-content: center; gap: 20px;
+        margin-top: 14px;
+      }
+      .pb-btn {
+        background: none; border: none; color: rgba(251,245,221,0.35); cursor: pointer;
+        padding: 8px; font-size: 18px; line-height: 1;
+        transition: color .2s, background .15s; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .pb-btn:hover:not(:disabled) { color: #E7E1B1; background: rgba(251,245,221,0.07); }
+      .pb-btn:active:not(:disabled) { transform: scale(0.9); }
+      .pb-btn:disabled { opacity: .2; cursor: default; }
+      .pb-btn.play {
+        font-size: 20px; color: #FBF5DD;
+        background: rgba(251,245,221,0.1);
+        width: 44px; height: 44px; border-radius: 50%;
+        transition: color .2s, background .2s, transform .1s;
+      }
+      .pb-btn.play:hover:not(:disabled) { background: rgba(251,245,221,0.18); color: #fff; }
+      .pb-btn.play:active:not(:disabled) { transform: scale(0.94); }
+
+      /* Per-track actions */
+      .track-actions { display: flex; gap: 6px; margin-top: 12px; flex-wrap: wrap; }
+      .taction {
+        background: rgba(251,245,221,0.04); border: 1px solid rgba(251,245,221,0.1); color: rgba(251,245,221,0.48);
+        padding: 5px 12px; border-radius: 20px; font-size: 12px; cursor: pointer;
+        transition: border-color .2s, color .2s, background .2s; display: inline-flex; align-items: center; gap: 4px;
+        text-decoration: none;
+      }
+      .taction:hover:not(:disabled) { border-color: rgba(251,245,221,0.28); color: #FBF5DD; background: rgba(251,245,221,0.08); }
+      .taction:disabled { opacity: .35; cursor: default; }
+      .taction.liked { border-color: rgba(233,30,99,0.5); color: #e91e63; background: rgba(233,30,99,0.07); }
+      .taction.liked:hover { border-color: #ff4081; color: #ff4081; background: rgba(233,30,99,0.12); }
+      .taction.lyrics-on { border-color: rgba(48,109,41,0.6); color: #8cc47f; background: rgba(48,109,41,0.1); }
+      .nothing-playing { color: rgba(251,245,221,0.22); text-align: center; padding: 14px 0 6px; font-size: 14px; }
+
+      /* Recently played */
+      .recent-item {
+        display: flex; gap: 12px; align-items: center;
+        padding: 9px 6px; border-bottom: 1px solid rgba(251,245,221,0.05); cursor: pointer;
+        transition: background .15s; border-radius: 8px; margin: 0 -6px;
+      }
+      .recent-item:last-child { border-bottom: none; }
+      .recent-item:hover { background: rgba(251,245,221,0.04); }
+      .recent-item:hover .recent-track { color: #E7E1B1; }
+      .recent-art    { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
+      .recent-art-ph { width: 40px; height: 40px; border-radius: 6px; background: #0e1f0e; flex-shrink: 0; }
+      .recent-info   { flex: 1; min-width: 0; }
+      .recent-track  { font-size: 13px; font-weight: 600; color: #FBF5DD; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: color .2s; }
+      .recent-artist { font-size: 12px; color: rgba(251,245,221,0.38); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .recent-time   { font-size: 11px; color: rgba(251,245,221,0.22); flex-shrink: 0; }
+      .recent-hint   { font-size: 11px; color: rgba(251,245,221,0.16); text-align: center; padding-top: 10px; }
+
+      /* Status banner */
+      .banner {
+        border-radius: 12px; padding: 13px 16px; margin-bottom: 12px;
+        font-size: 13px; line-height: 1.4;
+      }
+      .banner-success { background: rgba(48,109,41,0.1); border: 1px solid rgba(48,109,41,0.4); color: #8cc47f; }
+      .banner-error   { background: rgba(255,60,60,0.05); border: 1px solid rgba(255,60,60,0.2); color: #ff6666; }
+      .banner-warning { background: rgba(231,225,177,0.06); border: 1px solid rgba(231,225,177,0.2); color: #E7E1B1; }
+      .add-anyway {
+        display: inline-block; margin-top: 8px; background: none;
+        border: 1px solid rgba(231,225,177,0.25); color: #E7E1B1;
+        padding: 5px 14px; border-radius: 20px; font-size: 12px; cursor: pointer;
+        transition: background .2s;
+      }
+      .add-anyway:hover { background: rgba(231,225,177,0.07); }
+
+      /* Playlist section */
+      .section-hdr {
+        display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;
+      }
+      .section-label {
+        font-size: 10px; font-weight: 700; letter-spacing: 1.8px;
+        text-transform: uppercase; color: rgba(231,225,177,0.35);
+      }
+
+      /* Pinned playlists */
+      .pins { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+      .pin-btn {
+        display: flex; align-items: center; max-width: 160px;
+        background: rgba(251,245,221,0.04); border: 1px solid rgba(251,245,221,0.1); color: rgba(251,245,221,0.52);
+        padding: 6px 14px; border-radius: 20px; font-size: 12px; cursor: pointer;
+        transition: border-color .2s, color .2s, background .2s;
+      }
+      .pin-btn:hover { border-color: rgba(251,245,221,0.24); color: #E7E1B1; background: rgba(251,245,221,0.07); }
+      .pin-btn.active { border-color: #306D29; background: rgba(48,109,41,0.15); color: #FBF5DD; }
+      .pin-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .pin-add {
+        background: none; border: 1px dashed rgba(251,245,221,0.14); color: rgba(251,245,221,0.28);
+        padding: 6px 12px; border-radius: 20px; font-size: 12px; cursor: pointer;
+        transition: border-color .2s, color .2s;
+      }
+      .pin-add:hover { border-color: rgba(48,109,41,0.5); color: #8cc47f; }
+
+      .in-pl-note { font-size: 11px; color: #E7E1B1; margin-bottom: 8px; }
+      .pl-search {
+        width: 100%;
+        background: rgba(251,245,221,0.04);
+        border: 1px solid rgba(251,245,221,0.08);
+        border-radius: 10px; padding: 11px 14px; color: #FBF5DD; font-size: 14px;
+        margin-bottom: 8px; outline: none; transition: border-color .2s, background .2s;
+      }
+      .pl-search:focus    { border-color: rgba(48,109,41,0.6); background: rgba(251,245,221,0.06); }
+      .pl-search::placeholder { color: rgba(251,245,221,0.22); }
+      .pl-select {
+        width: 100%;
+        background: rgba(251,245,221,0.04);
+        border: 1px solid rgba(251,245,221,0.08);
+        border-radius: 10px; padding: 11px 14px; color: #FBF5DD; font-size: 14px;
+        margin-bottom: 8px; outline: none; appearance: none; cursor: pointer;
+        transition: border-color .2s;
+      }
+      .pl-select:focus { border-color: rgba(48,109,41,0.6); }
+      .pl-loading { color: rgba(251,245,221,0.3); font-size: 13px; text-align: center; padding: 10px 0 14px; }
+      .pl-empty   { color: rgba(251,245,221,0.22); font-size: 13px; text-align: center; padding: 10px 0 14px; }
+      .pl-error   { color: #ff6666; font-size: 13px; text-align: center; padding: 10px 0 14px; }
+      .pl-retry   {
+        display: inline-block; margin-top: 6px; background: none;
+        border: 1px solid rgba(255,60,60,0.25); color: #ff6666;
+        padding: 5px 14px; border-radius: 20px; font-size: 12px; cursor: pointer;
+        transition: background .2s;
+      }
+      .pl-retry:hover { background: rgba(255,60,60,0.06); }
+      .add-btn {
+        width: 100%;
+        background: #FBF5DD;
+        color: #0D530E; border: none;
+        padding: 15px; border-radius: 50px; font-size: 15px; font-weight: 700;
+        cursor: pointer; transition: opacity .2s, transform .1s;
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+        margin-top: 6px; letter-spacing: 0.2px;
+      }
+      .add-btn:hover:not(:disabled)  { opacity: 0.88; }
+      .add-btn:active:not(:disabled) { transform: scale(0.98); }
+      .add-btn:disabled { background: #1a2e1a; color: rgba(251,245,221,0.18); cursor: not-allowed; }
+      .kbd-hint { font-size: 11px; color: rgba(251,245,221,0.15); text-align: right; margin-top: 7px; }
+      .kbd { background: rgba(251,245,221,0.05); border: 1px solid rgba(251,245,221,0.1); border-radius: 4px; padding: 1px 6px; font-size: 10px; font-family: monospace; color: rgba(251,245,221,0.3); }
+
+      /* History */
+      .hist-item {
+        display: flex; gap: 12px; align-items: center;
+        padding: 10px 0; border-bottom: 1px solid rgba(251,245,221,0.05);
+      }
+      .hist-item:last-child { border-bottom: none; }
+      .hist-art  { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; flex-shrink: 0; }
+      .hist-art-ph { width: 44px; height: 44px; border-radius: 8px; background: #0e1f0e; flex-shrink: 0; }
+      .hist-info { flex: 1; min-width: 0; }
+      .hist-track  { font-size: 13px; font-weight: 600; color: #FBF5DD; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .hist-artist { font-size: 12px; color: rgba(251,245,221,0.38); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .hist-pl     { font-size: 11px; color: #7cc471; margin-top: 3px; }
+      .hist-time   { font-size: 11px; color: rgba(251,245,221,0.22); flex-shrink: 0; }
+      .hist-empty  { color: rgba(251,245,221,0.16); font-size: 13px; text-align: center; padding: 18px 0; }
+      .hist-btns   { display: flex; gap: 6px; }
+      .icon-btn {
+        background: rgba(251,245,221,0.04); border: 1px solid rgba(251,245,221,0.08); font-size: 11px; cursor: pointer;
+        padding: 3px 10px; border-radius: 20px; transition: color .2s, border-color .2s, background .2s; color: rgba(251,245,221,0.28);
+      }
+      .icon-btn.export:hover { color: #8cc47f; border-color: rgba(48,109,41,0.4); }
+      .icon-btn.clear:hover  { color: #ff5555; border-color: rgba(255,60,60,0.3); }
+
+      /* Lyrics */
+      .lyrics-panel {
+        margin-top: 16px; border-top: 1px solid rgba(251,245,221,0.06); padding-top: 14px;
+      }
+      .lyrics-container {
+        max-height: 260px; overflow-y: auto; scroll-behavior: smooth; padding: 4px 0;
+      }
+      .lyrics-container::-webkit-scrollbar { width: 3px; }
+      .lyrics-container::-webkit-scrollbar-track { background: transparent; }
+      .lyrics-container::-webkit-scrollbar-thumb { background: rgba(48,109,41,0.4); border-radius: 2px; }
+      .lyric-line {
+        padding: 5px 0; font-size: 14px; color: rgba(251,245,221,0.18); line-height: 1.65;
+        transition: color .3s, font-size .25s, font-weight .25s;
+        cursor: default; user-select: none;
+      }
+      .lyric-line.near  { color: rgba(251,245,221,0.44); }
+      .lyric-line.active { color: #FBF5DD; font-size: 16px; font-weight: 700; }
+      .lyric-line.plain  { color: rgba(251,245,221,0.44); font-size: 14px; }
+      .lyrics-status { font-size: 13px; color: rgba(251,245,221,0.24); text-align: center; padding: 16px 0; }
+
+      /* Spinner */
+      .spin {
+        display: inline-block; width: 14px; height: 14px;
+        border: 2px solid rgba(251,245,221,.1); border-top-color: currentColor;
+        border-radius: 50%; animation: rot .6s linear infinite;
+      }
+      .spin-lg { width: 36px; height: 36px; border-width: 3px; }
+      @keyframes rot { to { transform: rotate(360deg); } }
+      @keyframes pulse-live {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.35; transform: scale(0.65); }
+      }
+    `;
+
+    // ─── Spinner ──────────────────────────────────────────────────────────────────
+    function Spinner({ large }) {
+      return <span className={`spin${large ? " spin-lg" : ""}`} aria-hidden="true" />;
+    }
+
+    // ─── Progress bar ─────────────────────────────────────────────────────────────
+    function ProgressBar({ track }) {
+      const [posMs, setPosMs] = useState(0);
+
+      useEffect(() => {
+        if (!track) { setPosMs(0); return; }
+        const tick = () => {
+          const elapsed = track.isPlaying
+            ? Math.max(0, Date.now() - (track.fetchedAt || Date.now()))
+            : 0;
+          setPosMs(Math.min(track.progressMs + elapsed, track.durationMs || 0));
+        };
+        tick();
+        const t = setInterval(tick, 500);
+        return () => clearInterval(t);
+      }, [track]);
+
+      const pct = track?.durationMs > 0 ? Math.min(100, (posMs / track.durationMs) * 100) : 0;
+
+      return (
+        <div className="progress-wrap">
+          <div className="progress-bar">
+            <div className="progress-fill" style={{ width: `${pct}%` }} />
+          </div>
+          <div className="progress-times">
+            <span>{fmtMs(posMs)}</span>
+            <span>{fmtMs(track?.durationMs)}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Main component ────────────────────────────────────────────────────────────
+    function Spot4Me() {
+      // Auth
+      const [authStatus, setAuthStatus] = useState("checking");
+      const [authError,  setAuthError]  = useState(null);
+
+      // Track
+      const [track,        setTrack]        = useState(null);
+      const [trackLoading, setTrackLoading] = useState(false);
+      const [liked,        setLiked]        = useState(null);
+      const [likeLoading,  setLikeLoading]  = useState(false);
+
+      // Playback controls
+      const [pbBusy, setPbBusy] = useState(false);
+
+      // Recently played
+      const [recentlyPlayed, setRecentlyPlayed] = useState([]);
+
+      // Playlists
+      const [playlists,        setPlaylists]        = useState([]);
+      const [playlistsLoading, setPlaylistsLoading] = useState(false);
+      const [playlistsError,   setPlaylistsError]   = useState(false);
+      const [playlistSearch,   setPlaylistSearch]   = useState("");
+      const [selectedPl,       setSelectedPl]       = useState(null);
+      const [pinnedPls,        setPinnedPls]        = useState(readPinned);
+      const [plUsage,          setPlUsage]          = useState(readPlUsage);
+
+      // Dup check
+      const [alreadyInPl,        setAlreadyInPl]        = useState(null);
+      const [alreadyInPlLoading, setAlreadyInPlLoading] = useState(false);
+
+      // Add / status
+      const [status,        setStatus]        = useState(null);
+      const [showAddAnyway, setShowAddAnyway] = useState(false);
+      const [adding,        setAdding]        = useState(false);
+
+      // History
+      const [history, setHistory] = useState(readHistory);
+
+      // Lyrics
+      const [showLyrics,     setShowLyrics]     = useState(false);
+      const [lyrics,         setLyrics]         = useState(null);
+      const [lyricsPlain,    setLyricsPlain]    = useState(false);
+      const [lyricsLoading,  setLyricsLoading]  = useState(false);
+      const [lyricsError,    setLyricsError]    = useState(false);
+      const [activeLyricIdx, setActiveLyricIdx] = useState(0);
+
+      // Refresh
+      const [paused,    setPaused]    = useState(false);
+      const [countdown, setCountdown] = useState(10);
+
+      // Refs
+      const pausedRef             = useRef(false);
+      const countdownRef          = useRef(10);
+      const timerRef              = useRef(null);
+      const handleAuthFailureRef  = useRef(null);
+      const genreCacheRef         = useRef({});
+      const fetchGenRef           = useRef(0);
+      const dupCheckGenRef        = useRef(0);
+      const trackSourceRef        = useRef("live");
+      const fetchRecentlyPlayedRef= useRef(null);
+      const lyricsContainerRef    = useRef(null);
+
+      // Register URL so auth redirect always knows where to return
+      useEffect(() => { localStorage.setItem(K.HOME_URL, window.location.href); }, []);
+
+      // Auto-dismiss success banners
+      useEffect(() => {
+        if (status?.type !== "success") return;
+        const t = setTimeout(() => setStatus(null), 3000);
+        return () => clearTimeout(t);
+      }, [status]);
+
+      // Bootstrap auth
+      useEffect(() => {
+        // Spotify redirects back to this page with ?code= — handle it directly
+        // so no separate auth-redirect page is needed.
+        const urlParams = new URLSearchParams(window.location.search);
+        const urlCode   = urlParams.get("code");
+        if (urlCode) {
+          window.history.replaceState({}, document.title, window.location.pathname);
+          exchangeCode(urlCode);
+          return;
+        }
+
+        const code    = localStorage.getItem(K.AUTH_CODE);
+        const token   = sessionStorage.getItem(K.ACCESS_TOKEN);
+        const refresh = localStorage.getItem(K.REFRESH_TOKEN);
+        if (code)        { exchangeCode(code); }
+        else if (token)  { _accessToken = token; setAuthStatus("authenticated"); }
+        else if (refresh) {
+          refreshAccessToken().then(t => {
+            if (t) { _accessToken = t; sessionStorage.setItem(K.ACCESS_TOKEN, t); setAuthStatus("authenticated"); }
+            else   { setAuthStatus("unauthenticated"); }
+          });
+        } else { setAuthStatus("unauthenticated"); }
+      }, []);
+
+      async function exchangeCode(code) {
+        setAuthStatus("authing");
+        localStorage.removeItem(K.AUTH_CODE);
+        const verifier = sessionStorage.getItem(K.VERIFIER);
+        if (!verifier) {
+          setAuthStatus("error");
+          setAuthError("PKCE verifier missing. Please try connecting again.");
+          return;
+        }
+        sessionStorage.removeItem(K.VERIFIER);
+        try {
+          const res = await fetch("https://accounts.spotify.com/api/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              grant_type:    "authorization_code",
+              code,
+              redirect_uri:  REDIRECT_URI,
+              client_id:     CLIENT_ID,
+              code_verifier: verifier,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) { setAuthStatus("error"); setAuthError(`Spotify: ${data.error} — ${data.error_description || ""}`); return; }
+          _accessToken = data.access_token;
+          sessionStorage.setItem(K.ACCESS_TOKEN, data.access_token);
+          if (data.refresh_token) localStorage.setItem(K.REFRESH_TOKEN, data.refresh_token);
+          setAuthStatus("authenticated");
+        } catch (err) { setAuthStatus("error"); setAuthError(`Network error: ${err.message}`); }
+      }
+
+      async function initiateAuth() {
+        const verifier  = randomString(128);
+        const challenge = await codeChallenge(verifier);
+        sessionStorage.setItem(K.VERIFIER, verifier);
+        // Pass the current URL in the state param — the auth redirect page uses this
+        // as the return address, so the app works from any host (not just github.io).
+        const params = new URLSearchParams({
+          client_id:             CLIENT_ID,
+          response_type:         "code",
+          redirect_uri:          REDIRECT_URI,
+          scope:                 SCOPES,
+          code_challenge_method: "S256",
+          code_challenge:        challenge,
+          state:                 window.location.href,
+        });
+        window.location.href = `https://accounts.spotify.com/authorize?${params}`;
+      }
+
+      function signOut() {
+        sessionStorage.removeItem(K.ACCESS_TOKEN);
+        sessionStorage.removeItem(K.VERIFIER);
+        localStorage.removeItem(K.REFRESH_TOKEN);
+        _accessToken = null;
+        clearInterval(timerRef.current);
+        setAuthStatus("unauthenticated");
+        setTrack(null); setLiked(null); setRecentlyPlayed([]);
+        setPlaylists([]); setSelectedPl(null); setStatus(null);
+        setAlreadyInPl(null); setCountdown(10);
+        setLyrics(null); setLyricsError(false); setShowLyrics(false);
+        trackSourceRef.current = "live";
+      }
+
+      function handleAuthFailure() { localStorage.removeItem(K.REFRESH_TOKEN); signOut(); }
+      handleAuthFailureRef.current = handleAuthFailure;
+
+      // ── Fetch currently playing ──────────────────────────────────────────────────
+      const fetchTrack = useCallback(async () => {
+        const myGen = ++fetchGenRef.current;
+        setTrackLoading(true);
+        try {
+          const res = await spotifyFetch("https://api.spotify.com/v1/me/player/currently-playing");
+          if (myGen !== fetchGenRef.current) return;
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+
+          if (res.status === 204) {
+            if (trackSourceRef.current === "live") setTrack(null);
+            fetchRecentlyPlayedRef.current?.();
+            return;
+          }
+          if (!res.ok) return;
+
+          const data = await res.json();
+          if (!data?.item) { if (trackSourceRef.current === "live") setTrack(null); return; }
+
+          let genres = [];
+          const artistId = data.item.artists?.[0]?.id;
+          if (artistId) {
+            if (Object.prototype.hasOwnProperty.call(genreCacheRef.current, artistId)) {
+              genres = genreCacheRef.current[artistId];
+            } else {
+              const ar = await spotifyFetch(`https://api.spotify.com/v1/artists/${artistId}`);
+              if (myGen !== fetchGenRef.current) return;
+              if (ar.ok) {
+                const ad = await ar.json();
+                genres = ad.genres?.slice(0, 3) || [];
+                genreCacheRef.current[artistId] = genres;
+              }
+            }
+          }
+
+          if (myGen !== fetchGenRef.current) return;
+          trackSourceRef.current = "live";
+          setTrack({
+            id:          data.item.id,
+            uri:         data.item.uri,
+            name:        data.item.name,
+            artist:      data.item.artists.map(a => a.name).join(", "),
+            album:       data.item.album.name,
+            albumArt:    data.item.album.images?.[0]?.url || null,
+            externalUrl: data.item.external_urls?.spotify || null,
+            genres,
+            isPlaying:   data.is_playing,
+            progressMs:  data.progress_ms  || 0,
+            durationMs:  data.item.duration_ms || 0,
+            fetchedAt:   Date.now(),
+          });
+        } catch (err) {
+          console.error("fetchTrack:", err);
+        } finally {
+          if (myGen === fetchGenRef.current) setTrackLoading(false);
+        }
+      }, []);
+
+      // ── Fetch playlists ──────────────────────────────────────────────────────────
+      const fetchPlaylists = useCallback(async () => {
+        setPlaylistsLoading(true);
+        setPlaylistsError(false);
+        const all = [];
+        let fetchFailed = false;
+        try {
+          let userId = null;
+          try {
+            const me = await spotifyFetch("https://api.spotify.com/v1/me");
+            if (me.authFailed) { handleAuthFailureRef.current(); return; }
+            if (me.ok) userId = (await me.json()).id;
+          } catch {}
+          let url = "https://api.spotify.com/v1/me/playlists?limit=50";
+          let pages = 0;
+          while (url && pages < 20) {
+            try {
+              const res = await spotifyFetch(url);
+              if (res.authFailed) { handleAuthFailureRef.current(); return; }
+              if (!res.ok) { fetchFailed = true; break; }
+              const data = await res.json();
+              const owned = userId
+                ? data.items.filter(p => p?.owner?.id === userId)
+                : data.items.filter(Boolean);
+              all.push(...owned);
+              url = data.next; pages++;
+            } catch { fetchFailed = true; break; }
+          }
+          setPlaylists(all);
+          setPlaylistsError(fetchFailed && all.length === 0);
+        } finally {
+          setPlaylistsLoading(false);
+        }
+      }, []);
+
+      // ── Fetch recently played ────────────────────────────────────────────────────
+      const fetchRecentlyPlayed = useCallback(async () => {
+        try {
+          const res = await spotifyFetch("https://api.spotify.com/v1/me/player/recently-played?limit=10");
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+          if (res.status === 403 || !res.ok) return;
+          const data = await res.json();
+          setRecentlyPlayed(
+            (data.items || []).map(item => ({
+              id:          item.track.id,
+              uri:         item.track.uri,
+              name:        item.track.name,
+              artist:      item.track.artists.map(a => a.name).join(", "),
+              album:       item.track.album.name,
+              albumArt:    item.track.album.images?.[0]?.url || null,
+              externalUrl: item.track.external_urls?.spotify || null,
+              durationMs:  item.track.duration_ms || 0,
+              playedAt:    item.played_at,
+            }))
+          );
+        } catch {}
+      }, []);
+      fetchRecentlyPlayedRef.current = fetchRecentlyPlayed;
+
+      // ── Like status ──────────────────────────────────────────────────────────────
+      const fetchLikeStatus = useCallback(async (trackUri) => {
+        try {
+          const res = await spotifyFetch(`https://api.spotify.com/v1/me/library/contains?uris=${encodeURIComponent(trackUri)}`);
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+          if (res.status === 403) { setLiked(null); return; }
+          if (res.ok) { const d = await res.json(); setLiked(d[0] ?? null); }
+        } catch { setLiked(null); }
+      }, []);
+
+      // ── Lyrics ───────────────────────────────────────────────────────────────────
+      const fetchLyrics = useCallback(async (name, artist, album, durationMs) => {
+        setLyricsLoading(true);
+        setLyrics(null); setLyricsError(false); setLyricsPlain(false); setActiveLyricIdx(0);
+        try {
+          const params = new URLSearchParams({
+            track_name:  name,
+            artist_name: artist.split(", ")[0],
+            album_name:  album || "",
+            duration:    Math.round((durationMs || 0) / 1000),
+          });
+          const res = await fetch(`https://lrclib.net/api/get?${params}`);
+          if (res.status === 404 || !res.ok) { setLyricsError(true); return; }
+          const data = await res.json();
+          if (data.syncedLyrics) {
+            const parsed = parseLrc(data.syncedLyrics);
+            if (parsed.length > 0) { setLyrics(parsed); setLyricsPlain(false); return; }
+          }
+          if (data.plainLyrics) {
+            const lines = data.plainLyrics.split("\n").map((text, i) => ({ timeMs: i, text }));
+            setLyrics(lines); setLyricsPlain(true); return;
+          }
+          setLyricsError(true);
+        } catch { setLyricsError(true); }
+        finally { setLyricsLoading(false); }
+      }, []);
+
+      // ── Dup check ────────────────────────────────────────────────────────────────
+      const checkAlreadyInPl = useCallback(async (trackUri, plId) => {
+        const myGen = ++dupCheckGenRef.current;
+        setAlreadyInPlLoading(true); setAlreadyInPl(null);
+        try {
+          let url = `https://api.spotify.com/v1/playlists/${plId}/items?limit=100&fields=items(item(uri)),next`;
+          while (url) {
+            if (myGen !== dupCheckGenRef.current) return;
+            const res = await spotifyFetch(url);
+            if (res.authFailed) { handleAuthFailureRef.current(); return; }
+            if (!res.ok) break;
+            const data = await res.json();
+            if (data.items?.some(i => i?.item?.uri === trackUri)) {
+              if (myGen === dupCheckGenRef.current) setAlreadyInPl(true);
+              return;
+            }
+            url = data.next;
+          }
+          if (myGen === dupCheckGenRef.current) setAlreadyInPl(false);
+        } catch {
+          if (myGen === dupCheckGenRef.current) setAlreadyInPl(null);
+        } finally {
+          if (myGen === dupCheckGenRef.current) setAlreadyInPlLoading(false);
+        }
+      }, []);
+
+      // ── Effects ──────────────────────────────────────────────────────────────────
+      useEffect(() => {
+        if (authStatus !== "authenticated") return;
+        fetchTrack(); fetchPlaylists(); fetchRecentlyPlayed();
+      }, [authStatus]);
+
+      useEffect(() => {
+        if (authStatus !== "authenticated") return;
+        timerRef.current = setInterval(() => {
+          if (pausedRef.current) return;
+          countdownRef.current -= 1;
+          setCountdown(countdownRef.current);
+          if (countdownRef.current <= 0) {
+            countdownRef.current = 10; setCountdown(10);
+            fetchTrack();
+          }
+        }, 1000);
+        return () => clearInterval(timerRef.current);
+      }, [authStatus, fetchTrack]);
+
+      useEffect(() => {
+        if (!track?.uri) { setLiked(null); return; }
+        setLiked(null); fetchLikeStatus(track.uri);
+      }, [track?.uri]);
+
+      useEffect(() => {
+        if (!track?.uri || !selectedPl?.id) { setAlreadyInPl(null); setAlreadyInPlLoading(false); return; }
+        setAlreadyInPl(null);
+        const t = setTimeout(() => checkAlreadyInPl(track.uri, selectedPl.id), 300);
+        return () => clearTimeout(t);
+      }, [track?.uri, selectedPl?.id]);
+
+      useEffect(() => {
+        if (!showLyrics || !track?.id) return;
+        fetchLyrics(track.name, track.artist, track.album || "", track.durationMs || 0);
+      }, [track?.id, showLyrics]);
+
+      useEffect(() => {
+        if (!lyrics || lyricsPlain) return;
+        const tick = () => {
+          if (!track) return;
+          const elapsed = track.isPlaying ? Math.max(0, Date.now() - (track.fetchedAt || Date.now())) : 0;
+          const currentMs = (track.progressMs || 0) + elapsed;
+          let idx = 0;
+          for (let i = 0; i < lyrics.length; i++) {
+            if (lyrics[i].timeMs <= currentMs) idx = i; else break;
+          }
+          setActiveLyricIdx(idx);
+        };
+        tick();
+        const t = setInterval(tick, 500);
+        return () => clearInterval(t);
+      }, [lyrics, lyricsPlain, track]);
+
+      useEffect(() => {
+        const container = lyricsContainerRef.current;
+        if (!container || lyricsPlain) return;
+        const active = container.querySelector(".lyric-line.active");
+        if (!active) return;
+        const target = active.offsetTop - container.clientHeight / 2 + active.clientHeight / 2;
+        container.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+      }, [activeLyricIdx, lyricsPlain]);
+
+      // Keyboard: Enter to add
+      useEffect(() => {
+        function onKey(e) {
+          if (e.key !== "Enter") return;
+          if (["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(e.target.tagName)) return;
+          if (track && selectedPl && !adding && !playlistsLoading) {
+            setStatus(null); setShowAddAnyway(false); addToPlaylist(false);
+          }
+        }
+        document.addEventListener("keydown", onKey);
+        return () => document.removeEventListener("keydown", onKey);
+      }, [track, selectedPl, adding, playlistsLoading]);
+
+      // ── Actions ──────────────────────────────────────────────────────────────────
+      function togglePause() { pausedRef.current = !pausedRef.current; setPaused(pausedRef.current); }
+
+      function manualRefresh() {
+        countdownRef.current = 10; setCountdown(10);
+        setStatus(null); setShowAddAnyway(false); fetchTrack();
+      }
+
+      async function toggleLike() {
+        if (!track || likeLoading || liked === null) return;
+        setLikeLoading(true);
+        try {
+          const res = await spotifyFetch("https://api.spotify.com/v1/me/library", {
+            method: liked ? "DELETE" : "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ uris: [track.uri] }),
+          });
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+          if (res.status < 300) setLiked(!liked);
+        } catch {}
+        setLikeLoading(false);
+      }
+
+      // ── NEW: Playback controls ───────────────────────────────────────────────────
+      async function skipNext() {
+        if (pbBusy) return;
+        setPbBusy(true);
+        try {
+          const res = await spotifyFetch("https://api.spotify.com/v1/me/player/next", { method: "POST" });
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+          if (res.status < 300 || res.status === 204) {
+            // Spotify needs ~300ms to update the player state
+            setTimeout(() => { countdownRef.current = 10; setCountdown(10); fetchTrack(); }, 400);
+          } else if (res.status === 403) {
+            setStatus({ type: "error", message: "Playback controls require Spotify Premium." });
+          }
+        } catch {}
+        finally { setTimeout(() => setPbBusy(false), 500); }
+      }
+
+      async function skipPrev() {
+        if (pbBusy) return;
+        setPbBusy(true);
+        try {
+          const res = await spotifyFetch("https://api.spotify.com/v1/me/player/previous", { method: "POST" });
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+          if (res.status < 300 || res.status === 204) {
+            setTimeout(() => { countdownRef.current = 10; setCountdown(10); fetchTrack(); }, 400);
+          } else if (res.status === 403) {
+            setStatus({ type: "error", message: "Playback controls require Spotify Premium." });
+          }
+        } catch {}
+        finally { setTimeout(() => setPbBusy(false), 500); }
+      }
+
+      async function togglePlayback() {
+        if (!track || pbBusy) return;
+        setPbBusy(true);
+        const endpoint = track.isPlaying ? "pause" : "play";
+        try {
+          const res = await spotifyFetch(`https://api.spotify.com/v1/me/player/${endpoint}`, { method: "PUT" });
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+          if (res.status < 300 || res.status === 204) {
+            setTrack(t => t ? { ...t, isPlaying: !t.isPlaying, fetchedAt: Date.now() } : t);
+          } else if (res.status === 403) {
+            setStatus({ type: "error", message: "Playback controls require Spotify Premium." });
+          } else if (res.status === 404) {
+            setStatus({ type: "error", message: "No active Spotify device — open Spotify on a device first." });
+          }
+        } catch {}
+        finally { setTimeout(() => setPbBusy(false), 300); }
+      }
+
+      async function addToQueue() {
+        if (!track) return;
+        try {
+          const res = await spotifyFetch(
+            `https://api.spotify.com/v1/me/player/queue?uri=${encodeURIComponent(track.uri)}`,
+            { method: "POST" }
+          );
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+          if (res.status < 300)    setStatus({ type: "success", message: `"${track.name}" added to queue` });
+          else if (res.status === 404) setStatus({ type: "error", message: "No active Spotify device — start playing something first." });
+          else if (res.status === 403) setStatus({ type: "error", message: "Queue requires Spotify Premium." });
+          else setStatus({ type: "error", message: `Could not add to queue (HTTP ${res.status})` });
+        } catch { setStatus({ type: "error", message: "Network error — could not add to queue." }); }
+      }
+
+      async function addToPlaylist(force = false) {
+        if (!track || !selectedPl || adding) return;
+        setAdding(true); setShowAddAnyway(false);
+        try {
+          if (!force) {
+            if (alreadyInPl === true) {
+              setStatus({ type: "warning", message: `"${track.name}" is already in ${selectedPl.name}.` });
+              setShowAddAnyway(true);
+              return;
+            }
+            let dupUrl = `https://api.spotify.com/v1/playlists/${selectedPl.id}/items?limit=100&fields=items(item(uri)),next`;
+            let isDupe = false;
+            while (dupUrl) {
+              const res = await spotifyFetch(dupUrl);
+              if (res.authFailed) { handleAuthFailureRef.current(); return; }
+              if (!res.ok) break;
+              const data = await res.json();
+              if (data.items?.some(i => i?.item?.uri === track.uri)) { isDupe = true; break; }
+              dupUrl = data.next;
+            }
+            if (isDupe) {
+              setStatus({ type: "warning", message: `"${track.name}" is already in ${selectedPl.name}.` });
+              setShowAddAnyway(true);
+              return;
+            }
+          }
+
+          const res = await spotifyFetch(`https://api.spotify.com/v1/playlists/${selectedPl.id}/items`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ uris: [track.uri] }),
+          });
+          if (res.authFailed) { handleAuthFailureRef.current(); return; }
+
+          if (res.ok) {
+            const entry = {
+              id:           Date.now(),
+              trackName:    track.name,
+              artist:       track.artist,
+              genre:        track.genres?.[0] || null,
+              albumArt:     track.albumArt,
+              playlistName: selectedPl.name,
+              timestamp:    new Date().toISOString(),
+            };
+            setHistory(prev => { const next = [entry, ...prev]; saveHistory(next); return next; });
+            setPlUsage(prev => {
+              const next = { ...prev, [selectedPl.id]: (prev[selectedPl.id] || 0) + 1 };
+              savePlUsage(next); return next;
+            });
+            setAlreadyInPl(true);
+            setStatus({ type: "success", message: `Added "${track.name}" to ${selectedPl.name}` });
+          } else {
+            let errMsg = `HTTP ${res.status}`;
+            try { const e = await res.json(); errMsg = e?.error?.message || errMsg; } catch {}
+            setStatus({ type: "error", message: `Could not add track: ${errMsg}` });
+          }
+        } catch (err) {
+          setStatus({ type: "error", message: "Network error — could not add track." });
+        } finally {
+          setAdding(false);
+        }
+      }
+
+      function selectRecentTrack(item) {
+        trackSourceRef.current = "recent";
+        setTrack({ ...item, genres: [], isPlaying: false, progressMs: 0, fetchedAt: Date.now() });
+        setStatus(null); setShowAddAnyway(false);
+        setLyrics(null); setLyricsError(false);
+      }
+
+      function pinPlaylist(pl) {
+        if (pinnedPls.length >= 3 || pinnedPls.some(p => p.id === pl.id)) return;
+        const next = [...pinnedPls, { id: pl.id, name: pl.name }];
+        setPinnedPls(next); savePinned(next);
+      }
+
+      function unpinPlaylist(id) {
+        const next = pinnedPls.filter(p => p.id !== id);
+        setPinnedPls(next); savePinned(next);
+      }
+
+      function handlePlaylistSearch(value) {
+        setPlaylistSearch(value);
+        if (selectedPl) {
+          const stillVisible = playlists.some(
+            p => p.id === selectedPl.id && p.name.toLowerCase().includes(value.toLowerCase())
+          );
+          if (!stillVisible) setSelectedPl(null);
+        }
+      }
+
+      function clearHistory() { setHistory([]); saveHistory([]); }
+
+      // ── Derived ──────────────────────────────────────────────────────────────────
+      const filteredPl = playlists
+        .filter(p => p.name.toLowerCase().includes(playlistSearch.toLowerCase()))
+        .sort((a, b) => (plUsage[b.id] || 0) - (plUsage[a.id] || 0));
+
+      const isPinned = selectedPl ? pinnedPls.some(p => p.id === selectedPl.id) : false;
+      const canPin   = !isPinned && pinnedPls.length < 3;
+
+      // ── Auth screens ─────────────────────────────────────────────────────────────
+      if (authStatus === "checking" || authStatus === "authing") {
+        return (
+          <div className="app"><style>{CSS}</style>
+            <div className="center-screen">
+              <Spinner large />
+              <span style={{ color: "#666", fontSize: 14 }}>
+                {authStatus === "checking" ? "Checking session…" : "Connecting to Spotify…"}
+              </span>
+            </div>
+          </div>
+        );
+      }
+
+      if (authStatus === "error") {
+        return (
+          <div className="app"><style>{CSS}</style>
+            <div className="err-card">
+              <div className="err-title">Authentication failed</div>
+              <div className="err-msg">{authError}</div>
+              <button className="err-retry" onClick={() => { setAuthStatus("unauthenticated"); setAuthError(null); }}>
+                Try again
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      if (authStatus === "unauthenticated") {
+        return (
+          <div className="app"><style>{CSS}</style>
+            <div className="center-screen">
+              <div className="auth-icon">♫</div>
+              <div>
+                <div className="auth-title">Spot4Me</div>
+                <p className="auth-sub" style={{ marginTop: 8 }}>
+                  See what's playing and save it to your Spotify playlists instantly.
+                </p>
+              </div>
+              <button className="connect-btn" onClick={initiateAuth}>Connect with Spotify</button>
+            </div>
+          </div>
+        );
+      }
+
+      // ── Main app ─────────────────────────────────────────────────────────────────
+      return (
+        <div className="app">
+          <style>{CSS}</style>
+
+          <div className="hdr">
+            <div className="logo">Spot4Me</div>
+            <button className="sign-out-btn" onClick={signOut}>Sign out</button>
+          </div>
+
+          {/* Now Playing */}
+          <div className="card">
+            <div className="card-hdr">
+              <span className="card-label">
+                {trackSourceRef.current === "recent"
+                  ? "⏹ Recently played"
+                  : track
+                    ? (track.isPlaying
+                        ? <><span className="live-dot" aria-hidden="true" />Now playing</>
+                        : "⏸ Paused")
+                    : "Now playing"}
+              </span>
+              <div className="np-controls">
+                <button className="ctrl" onClick={togglePause}
+                  title={paused ? "Resume auto-refresh" : "Pause auto-refresh"}>
+                  {paused ? "▶" : "⏸"}
+                </button>
+                <span className="cd-label">{paused ? "—" : countdown}</span>
+                <button className="ctrl" onClick={manualRefresh} disabled={trackLoading}
+                  title="Refresh now">
+                  {trackLoading ? <Spinner /> : "↻"}
+                </button>
+              </div>
+            </div>
+
+            {track ? (
+              <>
+                <div className="np-body">
+                  {track.albumArt
+                    ? <img src={track.albumArt} alt="Album art" className="album-art" />
+                    : <div className="album-art-ph">♫</div>
+                  }
+                  <div className="np-text">
+                    <div className="np-track">{track.name}</div>
+                    <div className="np-artist">{track.artist}</div>
+                    <div className="np-album">{track.album}</div>
+                    {track.genres?.length > 0 && (
+                      <div className="genre-tags">
+                        {track.genres.map(g => <span key={g} className="genre-tag">{g}</span>)}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Progress bar */}
+                <ProgressBar track={track} />
+
+                {/* Playback controls */}
+                <div className="playback-controls">
+                  <button className="pb-btn" onClick={skipPrev} disabled={pbBusy || trackSourceRef.current === "recent"}
+                    title="Previous track">⏮</button>
+                  <button className="pb-btn play" onClick={togglePlayback} disabled={pbBusy}
+                    title={track.isPlaying ? "Pause" : "Play"}>
+                    {track.isPlaying ? "⏸" : "▶"}
+                  </button>
+                  <button className="pb-btn" onClick={skipNext} disabled={pbBusy || trackSourceRef.current === "recent"}
+                    title="Next track">⏭</button>
+                </div>
+
+                {/* Per-track actions */}
+                <div className="track-actions">
+                  {liked !== null && (
+                    <button
+                      className={`taction${liked ? " liked" : ""}`}
+                      onClick={toggleLike}
+                      disabled={likeLoading}
+                      title={liked ? "Remove from Liked Songs" : "Add to Liked Songs"}
+                    >
+                      {likeLoading ? <Spinner /> : (liked ? "♥" : "♡")} {liked ? "Liked" : "Like"}
+                    </button>
+                  )}
+                  <button className="taction" onClick={addToQueue} title="Add to queue">+ Queue</button>
+                  {track.externalUrl && (
+                    <a className="taction" href={track.externalUrl} target="_blank" rel="noopener noreferrer">
+                      Spotify ↗
+                    </a>
+                  )}
+                  <button className={`taction${showLyrics ? " lyrics-on" : ""}`}
+                    onClick={() => setShowLyrics(v => !v)}>
+                    ♪ Lyrics
+                  </button>
+                </div>
+
+                {/* Lyrics panel */}
+                {showLyrics && (
+                  <div className="lyrics-panel">
+                    {lyricsLoading ? (
+                      <div className="lyrics-status"><Spinner /> Finding lyrics…</div>
+                    ) : lyricsError ? (
+                      <div className="lyrics-status">No lyrics found for this track</div>
+                    ) : lyrics?.length > 0 ? (
+                      <div className="lyrics-container" ref={lyricsContainerRef}>
+                        {lyrics.map((line, i) => (
+                          <div key={i} className={[
+                            "lyric-line",
+                            lyricsPlain ? "plain" : "",
+                            !lyricsPlain && i === activeLyricIdx ? "active" : "",
+                            !lyricsPlain && (i === activeLyricIdx - 1 || i === activeLyricIdx + 1) ? "near" : "",
+                          ].filter(Boolean).join(" ")}>
+                            {line.text || " "}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <div className="nothing-playing">
+                  {trackLoading ? <Spinner /> : "Nothing playing — start something on Spotify."}
+                </div>
+                {!trackLoading && recentlyPlayed.length > 0 && (
+                  <>
+                    {recentlyPlayed.map(item => (
+                      <div key={`${item.id}-${item.playedAt}`} className="recent-item"
+                        onClick={() => selectRecentTrack(item)}
+                        role="button" tabIndex={0}
+                        onKeyDown={e => e.key === "Enter" && selectRecentTrack(item)}>
+                        {item.albumArt
+                          ? <img src={item.albumArt} alt="" className="recent-art" />
+                          : <div className="recent-art-ph" />
+                        }
+                        <div className="recent-info">
+                          <div className="recent-track">{item.name}</div>
+                          <div className="recent-artist">{item.artist}</div>
+                        </div>
+                        <div className="recent-time">{relativeTime(item.playedAt)}</div>
+                      </div>
+                    ))}
+                    <div className="recent-hint">Tap a track to add it to a playlist</div>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Status banner */}
+          {status && (
+            <div className={`banner banner-${status.type}`} role="status">
+              {status.message}
+              {showAddAnyway && (
+                <button className="add-anyway" onClick={() => addToPlaylist(true)}>Add anyway</button>
+              )}
+            </div>
+          )}
+
+          {/* Add to playlist */}
+          <div className="card">
+            <div className="section-hdr">
+              <div className="section-label">Add to playlist</div>
+              {selectedPl && canPin && (
+                <button className="pin-add" onClick={() => pinPlaylist(selectedPl)}
+                  title="Pin for quick access">
+                  📌 Pin
+                </button>
+              )}
+            </div>
+
+            {pinnedPls.length > 0 && (
+              <div className="pins">
+                {pinnedPls.map(p => (
+                  <button key={p.id}
+                    className={`pin-btn${selectedPl?.id === p.id ? " active" : ""}`}
+                    onClick={() => {
+                      if (selectedPl?.id === p.id) {
+                        setSelectedPl(null);
+                      } else {
+                        setSelectedPl(playlists.find(pl => pl.id === p.id) || { id: p.id, name: p.name });
+                      }
+                      setStatus(null); setShowAddAnyway(false);
+                    }}>
+                    <span className="pin-name">{p.name}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <input
+              className="pl-search"
+              placeholder="Search your playlists…"
+              value={playlistSearch}
+              aria-label="Search playlists"
+              onChange={e => handlePlaylistSearch(e.target.value)}
+            />
+
+            {playlistsLoading ? (
+              <div className="pl-loading"><Spinner /> Loading playlists…</div>
+            ) : playlistsError ? (
+              <div className="pl-error">
+                Failed to load playlists.<br />
+                <button className="pl-retry" onClick={fetchPlaylists}>Retry</button>
+              </div>
+            ) : filteredPl.length === 0 ? (
+              <div className="pl-empty">
+                {playlists.length === 0 ? "No playlists found." : "No playlists match your search."}
+              </div>
+            ) : (
+              <select
+                className="pl-select"
+                value={selectedPl?.id || ""}
+                aria-label="Select a playlist"
+                onChange={e => {
+                  setSelectedPl(filteredPl.find(p => p.id === e.target.value) || null);
+                  setStatus(null); setShowAddAnyway(false);
+                }}>
+                <option value="">Choose a playlist…</option>
+                {filteredPl.map(p => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            )}
+
+            {selectedPl && track && (
+              alreadyInPlLoading
+                ? <div className="in-pl-note"><Spinner /> Checking…</div>
+                : alreadyInPl === true
+                  ? <div className="in-pl-note">⚠ Already in this playlist</div>
+                  : null
+            )}
+
+            <button
+              className="add-btn"
+              disabled={!track || !selectedPl || adding || playlistsLoading}
+              onClick={() => { setStatus(null); setShowAddAnyway(false); addToPlaylist(false); }}>
+              {adding ? <><Spinner /> Adding…</> : "Add to Playlist"}
+            </button>
+
+            {track && selectedPl && !adding && (
+              <div className="kbd-hint">Press <kbd className="kbd">Enter</kbd> to add</div>
+            )}
+          </div>
+
+          {/* History */}
+          <div className="card">
+            <div className="section-hdr">
+              <div className="section-label">History</div>
+              {history.length > 0 && (
+                <div className="hist-btns">
+                  <button className="icon-btn export" onClick={() => exportHistoryCsv(history)}
+                    title="Export CSV">↓ CSV</button>
+                  <button className="icon-btn clear" onClick={clearHistory}>Clear</button>
+                </div>
+              )}
+            </div>
+            {history.length === 0 ? (
+              <div className="hist-empty">Tracks you add will appear here.</div>
+            ) : (
+              history.map(e => (
+                <div key={e.id} className="hist-item">
+                  {e.albumArt
+                    ? <img src={e.albumArt} alt="" className="hist-art" />
+                    : <div className="hist-art-ph" />
+                  }
+                  <div className="hist-info">
+                    <div className="hist-track">{e.trackName}</div>
+                    <div className="hist-artist">{e.artist}{e.genre ? ` · ${e.genre}` : ""}</div>
+                    <div className="hist-pl">→ {e.playlistName}</div>
+                  </div>
+                  <div className="hist-time">{relativeTime(e.timestamp)}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<Spot4Me />);
+  </script>
+</body>
+</html>
