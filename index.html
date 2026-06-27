@@ -709,19 +709,21 @@
           if (!data?.item) { if (trackSourceRef.current === "live") setTrack(null); return; }
 
           let genres = [];
-          const artistId = data.item.artists?.[0]?.id;
-          if (artistId) {
-            if (Object.prototype.hasOwnProperty.call(genreCacheRef.current, artistId)) {
-              genres = genreCacheRef.current[artistId];
-            } else {
-              const ar = await spotifyFetch(`https://api.spotify.com/v1/artists/${artistId}`);
-              if (myGen !== fetchGenRef.current) return;
-              if (ar.ok) {
-                const ad = await ar.json();
-                genres = ad.genres?.slice(0, 3) || [];
-                genreCacheRef.current[artistId] = genres;
+          const artistIds = (data.item.artists || []).map(a => a.id).filter(Boolean);
+          if (artistIds.length > 0) {
+            const genreArrays = await Promise.all(artistIds.map(async (artistId) => {
+              if (Object.prototype.hasOwnProperty.call(genreCacheRef.current, artistId)) {
+                return genreCacheRef.current[artistId];
               }
-            }
+              const ar = await spotifyFetch(`https://api.spotify.com/v1/artists/${artistId}`);
+              if (!ar.ok) return [];
+              const ad = await ar.json();
+              const g = ad.genres || [];
+              genreCacheRef.current[artistId] = g;
+              return g;
+            }));
+            if (myGen !== fetchGenRef.current) return;
+            genres = [...new Set(genreArrays.flat())];
           }
 
           if (myGen !== fetchGenRef.current) return;
